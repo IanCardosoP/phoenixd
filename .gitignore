@@ -1,0 +1,14 @@
+# Node / general OS cruft (prevent accidental adds)
+.DS_Store
+Thumbs.db
+
+# Phoenix runtime data (seed, db, logs, config) - DO NOT COMMIT
+data/
+data/**/*
+
+# Env files / secrets
+.env
+.env.*
+
+# Docker artefacts
+*.log
