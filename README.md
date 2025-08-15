@@ -1,219 +1,155 @@
-# Phoenixd Docker
+## Phoenixd Docker (custom hardened build)
 
-Contenedor listo para ejecutar `phoenixd` (daemon de Phoenix Server) junto con la utilidad `phoenix-cli`.
+Imagen auto-construida de `phoenixd` (v0.6.2) desde código fuente con enfoque en:
+1. Reproducibilidad (pin tag mediante `ARG PHOENIXD_BRANCH`).
+2. Endurecimiento (usuario no root, FS de solo lectura, eliminación de capacidades, `no-new-privileges`).
+3. Inicialización no interactiva (se auto-confirman los avisos en primer arranque).
+4. Persistencia explícita (volumen nombrado) y sin secret externo para la seed por defecto.
 
-## 🧱 Características
-- Multi-stage build (descarga -> runtime minimal Debian slim)
-- Ejecuta como usuario no root (`phoenix` UID/GID configurables)
-- Persistencia de datos fuera de la imagen: ahora se monta `./data` directamente como `/home/phoenix/.phoenix`
-- Incluye binarios: `phoenixd` y `phoenix-cli`
-- Dependencias runtime añadidas: `libsqlite3-0`, `libcurl4`, `ca-certificates`
+Estado actual alineado con el `Dockerfile` y `docker-compose.yml` de este repositorio, NO con la carpeta `.docker` oficial de ACINQ. Abajo se detalla cada diferencia y su razón.
 
-## 📂 Estructura interna de datos
-Al primer arranque se genera el siguiente contenido en `/home/phoenix/.phoenix` (home del usuario):
+---
+## Diferencias clave respecto a `ACINQ/phoenixd` (`v0.6.2` / `.docker` oficial)
+
+| Área | Upstream típico | Esta variante | Motivo del cambio |
+|------|-----------------|---------------|-------------------|
+| Origen binarios | Pre‑compilados (o build script simple) | Build desde fuente (`gradlew link...`) | Control de versión exacta y posibilidad de reproducir parches/hardening. |
+| Pin de versión | A menudo `latest` / imagen publicada | `ARG PHOENIXD_BRANCH=v0.6.2` | Evitar drift silencioso. |
+| Usuario | Puede ejecutar como root en algunos ejemplos | Usuario sistema `phoenix` UID/GID 1000 | Principio de mínimo privilegio. |
+| Directorio de datos | `$HOME/.phoenix` variable (ej. `/home/phoenix/.phoenix`) | `/phoenix/.phoenix` | Home explícito (`/phoenix`) simplifica paths y COPY chown. |
+| Seed vía secret | Usada (ej. `--seed-path` con `secrets:`) | Eliminada por defecto (autogenerada) | Reducir fallos de arranque y riesgo de reuso accidental de semilla. |
+| Flags de inicio | Mínimos / por defecto | `--http-bind-ip=0.0.0.0`, `--auto-liquidity=10m` | Acceso inter‑contenedor y monto de auto‑liquidez explícito. |
+| Confirmaciones interactivas | Requiere input manual primera vez | Entrada automática de "I understand" en entrypoint | Permite orquestación no interactiva (CI / infra). |
+| Persistencia | A veces bind host ad‑hoc | Volumen nombrado `phoenixd_datadir` | Evitar permisos inconsistentes (WSL/NTFS) y commits accidentales. |
+| Hardening | Básico / ninguno | `cap_drop: ALL`, `read_only: true`, `no-new-privileges`, `tmpfs /tmp` | Reducir superficie de ataque en runtime. |
+| Exposición HTTP | Puede mapear puerto públicamente | Solo `expose:` interno | Evitar exposición involuntaria; se añade puerto manual si se necesita. |
+| Dependencias runtime | Puede incluir libs extra | Solo `bash` y `ca-certificates` | Binarios Kotlin/Native estáticos; reducir tamaño/ataque. |
+
+---
+## Arquitectura del build
+
+Multi-stage:
+1. Stage `build`: Imagen base `eclipse-temurin:21-jdk-jammy`, clona repo en tag (`PHOENIXD_BRANCH`), ejecuta Gradle para generar ejecutables nativos `phoenixd` y `phoenix-cli` según `TARGETPLATFORM`.
+2. Stage `final`: `debian:bookworm-slim`, instala mínimos (`bash` `ca-certificates`), crea usuario, copia binarios, crea directorio de datos y entrypoint.
+
+El entrypoint detecta primera ejecución (ausencia de `seed.dat`) y suministra automáticamente las dos confirmaciones requeridas, luego arranca el daemon con los flags provenientes de `docker-compose.yml`.
+
+---
+## docker-compose (estado actual)
+
+Características destacadas:
+* Build local desde fuente (asegura versión esperada).
+* Volumen nombrado `phoenixd_datadir` en `/phoenix/.phoenix`.
+* Red externa `backend` para descubrimiento DNS de otros servicios.
+* API HTTP ligada a `0.0.0.0:9740` pero no publicada (solo `expose:`); otros contenedores acceden vía `http://phoenixd:9740`.
+* Hardening: sin capacidades, FS de solo lectura, `tmpfs` efímero para `/tmp` (noexec, nosuid, nodev), no escalado de privilegios.
+* Auto-liquidez configurada a `10m` sats.
+
+---
+## Datos y estructura en `/phoenix/.phoenix`
 
 | Archivo | Descripción |
 |---------|-------------|
-| `seed.dat` | Semilla BIP39 (12 palabras) en formato cifrado/propietario. Debe respaldarse de forma segura. |
-| `phoenix.conf` | Configuración generada. Contiene credenciales HTTP (`http-password`, `http-password-limited-access`). |
-| `phoenix.log` | Log del daemon. |
-| `phoenix.mainnet.*` | Base de datos sqlite (con WAL y SHM) con el estado de canales y pagos. |
+| `seed.dat` | Seed (12 palabras) – Respaldar offline inmediatamente. |
+| `phoenix.conf` | Config con contraseñas HTTP generadas. |
+| `phoenix.log` | Log principal del daemon. |
+| `phoenix.mainnet.*` | Base de datos sqlite (estado de canales / pagos). |
 
-Nota: El directorio de estado del daemon es `/home/phoenix/.phoenix` y se vincula directamente a `./data` en el host para persistencia real.
+Si pierdes `seed.dat` pierdes acceso a los fondos: prioriza backup seguro.
 
-## 🔐 Autenticación y contraseñas
-Phoenixd expone una API HTTP en `127.0.0.1:9740` (por defecto). Las contraseñas se leen de `phoenix.conf`:
+---
+## Flujo de uso rápido
 
-```
-http-password=<token_full_access>
-http-password-limited-access=<token_limited>
-```
-
-No se crea `auth.dat`; los tokens están directamente en `phoenix.conf`.
-
-### Acceso completo vs limitado
-- `http-password`: operaciones completas (crear invoices, consultar pagos, etc.)
-- `http-password-limited-access`: acceso restringido (normalmente lectura / endpoints limitados). Ver documentación oficial de Phoenix para matices.
-
-## 🚀 Construir
-
-```pwsh
+```bash
 docker compose build
-```
-O manual:
-```pwsh
-docker build -t phoenixd:latest .
-```
-
-Variables de build opcionales (ARG):
-- `UID` / `GID` (por defecto 1000) para alinear ownership con tu host.
-
-## ▶️ Ejecutar (desarrollo)
-
-```pwsh
 docker compose up -d
-```
-Logs:
-```pwsh
-docker logs -f phoenixd
+docker logs -f phoenixd  # ver confirmación de arranque y nodeid
+
+# Obtener contraseñas HTTP
+docker exec phoenixd grep http-password /phoenix/.phoenix/phoenix.conf
+
+# Info general
+docker exec phoenixd /phoenix/phoenix-cli getinfo
 ```
 
-Primer arranque: verás prompts informativos (backup seed, liquidity). Tras ese inicio, el daemon continúa y escucha en `127.0.0.1:9740`.
+Para acceder desde otro contenedor en la misma red:
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://phoenixd:9740/  # devolverá 404 si vivo
+```
 
-## 🌐 Exponer API fuera del host
-Modificar en `docker-compose.yml`:
+Publicar externamente (solo si entiendes los riesgos):
 ```yaml
-    ports:
-      - "9740:9740"
+  ports:
+    - "9740:9740"
 ```
-Esto ya existe, pero la app liga a `127.0.0.1` dentro del contenedor. Para aceptar conexiones externas, deberás usar `--http-bind-ip=0.0.0.0` (ver sección CLI) o variable/env según soporte futuro. Puedes crear un override:
+Recomendado: usar un reverse proxy TLS y limitar IPs.
 
-```pwsh
-docker exec phoenixd bash -lc 'phoenixd --http-bind-ip=0.0.0.0'
-```
+---
+## Ajustes frecuentes
 
-Mejor práctica: colocar un reverse proxy (Nginx / Caddy) con TLS delante y dejar phoenixd escuchando sólo en loopback.
+| Objetivo | Acción |
+|----------|--------|
+| Cambiar versión | Editar `PHOENIXD_BRANCH` en compose, rebuild `--no-cache`. |
+| Forzar testnet | Añadir a `command`: `--chain=testnet`. |
+| Cambiar auto-liquidez | Ajustar flag `--auto-liquidity=<m|2m|5m|10m|off>`. |
+| Importar seed existente | (Ocasional) añadir `--seed-path=/phoenix/.phoenix/seed.dat` tras copiar el archivo ANTES del primer arranque. |
+| Reemplazar seed (no recomendado) | Detener, borrar volumen, montar nuevo, reiniciar (generará seed nueva). |
+| Exponer HTTP solo a proxy | Mantener sin `ports:` y crear contenedor proxy en red `backend`. |
 
-## 🧪 Uso de phoenix-cli
-Ejemplos dentro del contenedor:
-```pwsh
-docker exec -it phoenixd bash -lc 'phoenix-cli getinfo'
-```
-Crear invoice (1,000 sats):
-```pwsh
-docker exec -it phoenixd bash -lc 'phoenix-cli createinvoice --amountSat=1000 --description="Pago test"'
-```
+---
+## Seguridad
 
-Pasar parámetros de red o bind:
-```pwsh
-docker exec -it phoenixd bash -lc 'phoenixd --http-bind-ip=0.0.0.0'
-```
+Buenas prácticas mínimas:
+1. Backup inmediato (seed + snapshot directorio) y almacenarlo cifrado.
+2. No compartir logs completos (pueden contener metadatos de canales). 
+3. Mantener la imagen reconstruida periódicamente para incorporar parches aguas arriba.
+4. Revisar que el volumen no se suba a control de versiones (agregar a `.gitignore`).
+5. Añadir firewall / ACL si publicas el puerto.
 
-## 📡 API REST (desde host)
-Primero extrae el token:
-```pwsh
-docker exec phoenixd bash -lc 'grep http-password /home/phoenix/.phoenix/phoenix.conf'
-```
-Crear invoice:
-```pwsh
-curl -X POST http://localhost:9740/v1/invoices ^
-  -H "Authorization: Bearer <token_full_access>" ^
-  -H "Content-Type: application/json" ^
-  -d '{"amount":1000,"description":"Pago"}'
-```
-Consultar invoice:
-```pwsh
-curl http://localhost:9740/v1/invoices/<paymentHash> -H "Authorization: Bearer <token_full_access>"
-```
+Posibles mejoras futuras (no implementadas aún):
+* Verificación de integridad (pin de commit + checksum de tarball).
+* Healthcheck activo (actualmente se puede añadir manualmente si se desea).
+* Rotación automática de contraseñas (script externo / job). 
 
-## 💾 Persistencia
-La aplicación guarda todo en `/home/phoenix/.phoenix`. El `docker-compose.yml` ya monta:
-```yaml
-    volumes:
-      - ./data:/home/phoenix/.phoenix
-```
-Si `./data` no existe, créalo antes o Docker lo generará.
-Verifica contenido tras primer arranque:
-```pwsh
-docker exec phoenixd bash -lc 'ls -1 /home/phoenix/.phoenix'
-```
-Debe reflejarse en tu host en `./data`.
+---
+## Razonamiento de cambios frente a upstream
 
-### Persistencia real (qué significa)
-"Persistencia real" = los archivos críticos se almacenan fuera del FS efímero del contenedor. Si reconstruyes o eliminas el contenedor, los datos siguen en tu host.
+Resumidamente: la versión oficial prioriza simplicidad general; esta variante prioriza reproducibilidad y hardening para despliegues controlados. Algunos flags que fallaban al principio (por versión anterior en cache) llevaron a limpiar argumentos y hacer el build directo desde fuente para asegurar correspondencia entre código y opciones esperadas. Eliminar el secret de seed reduce puntos de error y evita reuso accidental; si la comunidad prefiere semilla gestionada externamente se puede reintroducir documentando muy claramente la unicidad de la seed.
 
-### Qué se persiste con `./data:/home/phoenix/.phoenix`
-- `seed.dat` (semilla BIP39) – CRÍTICO
-- `phoenix.mainnet.*` (estado de canales/pagos)
-- `phoenix.conf` (tokens API)
-- `phoenix.log` (auditoría / debugging)
-
-### Qué pasa si NO montas esa ruta
-- Se genera una nueva semilla ⇒ pérdida de acceso a fondos previos.
-- Tokens HTTP cambian.
-- Historial de pagos y canales se pierde.
-
-### Cómo montar correctamente (resumen)
-```pwsh
-New-Item -ItemType Directory data  # si no existe
+---
+## Actualizar a nueva versión
+```bash
+sed -i 's/PHOENIXD_BRANCH: v0.6.2/PHOENIXD_BRANCH: v0.X.Y/' docker-compose.yml
+docker compose build --no-cache
 docker compose up -d
+docker exec phoenixd /phoenix/phoenix-cli --version || docker logs phoenixd | grep -i version
 ```
-Verifica luego que `./data` contiene `seed.dat`, `phoenix.conf`, etc.
 
-### Migración desde un contenedor previo (antiguo montaje phoenix-home)
-```pwsh
-docker compose down
-mkdir data
-Copy-Item phoenix-home\* data -Recurse -Force  # PowerShell
-# o en Linux:
-# cp -a phoenix-home/* data/
+---
+## Troubleshooting breve
+
+| Síntoma | Causa probable | Acción |
+|---------|----------------|--------|
+| Loop con Usage | Flag no soportado / versión errónea | Rebuild con tag correcto; revisar `docker image ls`. |
+| 404 en raíz | Respuesta normal (endpoint no existe) | Usar endpoints documentados (`/v1/...`). |
+| Conexión rechazada desde otro contenedor | Bind en 127.0.0.1 | Añadir `--http-bind-ip=0.0.0.0`. |
+| Falta `seed.dat` tras reinicio | Volumen recreado | Restaurar backup; sin seed fondos perdidos. |
+| Permisos raros en host (WSL/NTFS) | Montaje sobre FS no POSIX | Usar volumen nombrado (ya adoptado). |
+
+---
+## Aviso
+El uso de esta imagen implica responsabilidad completa sobre la custodia. Comprueba siempre tus backups antes de usar con fondos reales.
+
+---
+## Licencia
+Respeta la licencia original de Phoenix. Este repositorio sólo aporta empaquetado y hardening.
+
+---
+## Resumen inmediato
+```bash
 docker compose up -d
+docker exec phoenixd grep http-password /phoenix/.phoenix/phoenix.conf
+docker exec phoenixd /phoenix/phoenix-cli getinfo
 ```
 
-### Riesgos y recomendaciones
-| Riesgo | Mitigación |
-|--------|------------|
-| Pérdida de seed.dat | Backup offline cifrado y prueba de restauración. |
-| Commit accidental de semilla | `.gitignore` incluye `data/`; nunca usar `git add -f`. |
-| Exposición de tokens | Restringir permisos del directorio; usar proxy seguro. |
-| Exposición directa puerto 9740 | Reverse proxy + TLS + firewall. |
-| Corrupción DB (crash/power loss) | Backups periódicos del directorio; snapshots antes de updates. |
-| Logs con datos sensibles | Rutina de rotación/limpieza y no compartir logs completos públicamente. |
-
-### Backups sugeridos
-Evento mínimo: tras recibir fondos significativos o abrir canal.
-Contenido: `seed.dat` + snapshot completo `.phoenix`.
-Almacenamiento: cifrado, redundante, geográficamente separado.
-Pruebas: Restauración en entorno aislado para validar integridad.
-
-## ♻️ Restart policy
-Añadir si deseas resiliencia:
-```yaml
-    restart: unless-stopped
-```
-Ya se añadió en el `docker-compose.yml` actual.
-
-## 🩺 Healthcheck opcional
-Puedes agregar (requiere `curl` en runtime si lo instalas):
-```yaml
-    healthcheck:
-      test: ["CMD", "bash", "-lc", "exec 3<>/dev/tcp/127.0.0.1/9740 || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-```
-El `docker-compose.yml` ya incluye un healthcheck TCP sin `curl`.
-
-## 🔐 Seguridad y buenas prácticas
-- Respaldar `seed.dat` inmediatamente (almacenar offline / cifrado)
-- Rotar tokens (editar `phoenix.conf` y reiniciar)  `docker exec phoenixd rotate-phoenix-http-passwords && docker restart phoenixd` 
-- No exponer directo el puerto 9740 a Internet sin proxy/TLS
-- Usar firewall para limitar IPs confiables
-- Mantener la imagen actualizada (rebuild periódico)
-
-## 🧽 Actualizar versión de phoenixd
-1. Cambiar la URL y la versión en el Dockerfile (dos lugares: nombre del zip y carpeta) 
-2. `docker compose build --no-cache && docker compose up -d`
-3. Verificar con: `docker exec phoenixd phoenix-cli --version` (si soporta `--version`) o revisar logs.
-
-## 🛠 Troubleshooting
-| Problema | Causa común | Solución |
-|----------|-------------|----------|
-| `libcurl.so.4 not found` | Faltaba `libcurl4` | Ya incluido en Dockerfile |
-| Tokens vacíos | Archivo no generado aún | Esperar primer arranque / revisar logs |
-| No persisten datos tras reinicio | No se montó home | Montar `./data:/home/phoenix/.phoenix` |
-| API inaccesible externamente | Bind 127.0.0.1 | Ejecutar con `--http-bind-ip=0.0.0.0` detrás de proxy |
-
-## 📜 Licencia
-Consulta la licencia oficial del proyecto Phoenix. Este wrapper Docker no altera la licencia original.
-
-## ✅ Resumen rápido
-```pwsh
-git clone <este-repo>
-cd phoenixd
-docker compose up -d
-docker exec phoenixd bash -lc 'grep http-password /home/phoenix/.phoenix/phoenix.conf'
-docker exec -it phoenixd bash -lc 'phoenix-cli getinfo'
-```
-
-Listo. Ajusta persistencia y seguridad antes de usar en producción.
+Listo. Ajusta seguridad y monitoreo antes de producción.
