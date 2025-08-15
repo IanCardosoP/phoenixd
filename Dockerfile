@@ -1,53 +1,67 @@
-# Etapa 1: descarga y preparación
-FROM debian:bullseye-slim AS downloader
+# Use Ubuntu image for building for compatibility with macOS arm64 builds
+FROM --platform=$BUILDPLATFORM eclipse-temurin:21-jdk-jammy AS build
 
-RUN apt-get update && apt-get install -y curl unzip && \
-    curl -L https://github.com/ACINQ/phoenixd/releases/download/v0.3.3/phoenix-0.3.3-linux-x64.zip -o phoenix.zip && \
-    unzip phoenix.zip && \
-    mv phoenix-0.3.3-linux-x64/phoenixd /phoenixd && \
-    mv phoenix-0.3.3-linux-x64/phoenix-cli /phoenix-cli && \
-    rm -rf phoenix.zip phoenix-0.3.3-linux-x64
+# Set necessary args and environment variables for building phoenixd
+ARG TARGETPLATFORM
+ARG PHOENIXD_BRANCH=v0.6.2
 
+# Upgrade all packages and install dependencies
+RUN apt-get update \
+    && apt-get upgrade -y
+RUN apt-get install -y --no-install-recommends bash git \
+    && apt clean
 
-# Etapa 2: imagen final ligera y segura
-FROM debian:bullseye-slim
+# Git pull phoenixd source at specified tag/branch and compile phoenixd
+WORKDIR /phoenixd
+RUN git clone --recursive --single-branch --branch ${PHOENIXD_BRANCH} -c advice.detachedHead=false \
+    https://github.com/ACINQ/phoenixd .
 
-# Crear usuario no root
-ARG UID=1000
-ARG GID=1000
-RUN groupadd -g ${GID} phoenix && \
-    useradd -m -u ${UID} -g ${GID} -s /bin/bash phoenix
+RUN case "${TARGETPLATFORM}" in \
+        "linux/amd64") ./gradlew linkPhoenixdReleaseExecutableLinuxX64 linkPhoenix-cliReleaseExecutableLinuxX64 ;; \
+        "linux/arm64") ./gradlew linkPhoenixdReleaseExecutableLinuxArm64 linkPhoenix-cliReleaseExecutableLinuxArm64 ;; \
+        *) echo "Unsupported TARGETPLATFORM: ${TARGETPLATFORM}" && exit 1 ;; \
+    esac
 
-# Instalar dependencias mínimas (incluye libsqlite3-0 requerida en runtime)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        libsqlite3-0 \
-        libcurl4 \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
+# Slim image to minimize final image size (Alpine is smaller but not glibc-based)
+FROM debian:bookworm-slim AS final
 
-# Copiar binarios desde etapa anterior (daemon y CLI)
-COPY --from=downloader /phoenixd /usr/local/bin/phoenixd
-COPY --from=downloader /phoenix-cli /usr/local/bin/phoenix-cli
+# Upgrade all packages and install dependencies
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends bash ca-certificates \
+    && apt clean
 
-# Script de rotación de passwords HTTP (shebang y generación segura)
-COPY rotate-phoenix-http-passwords.sh /usr/local/bin/rotate-phoenix-http-passwords
-RUN sed -i '1{/^\/\//d}' /usr/local/bin/rotate-phoenix-http-passwords && \
-        chmod 0755 /usr/local/bin/rotate-phoenix-http-passwords
-
-# Wrapper de entrypoint para asegurar permisos seguros del directorio de datos
-COPY --chmod=0755 <<'EOF' /usr/local/bin/docker-entrypoint.sh
-#!/usr/bin/env bash
-set -e
-# Asegura permisos estrictos en el directorio de datos (si existe)
-if [ -n "$HOME" ] && [ -d "$HOME/.phoenix" ]; then
-    chmod 700 "$HOME/.phoenix" 2>/dev/null || true
-fi
-exec phoenixd "$@"
-EOF
-
+# Create a phoenix group and user
+RUN addgroup --system phoenix --gid 1000 \
+    && adduser --system phoenix --ingroup phoenix --uid 1000 --home /phoenix
 USER phoenix
-WORKDIR /home/phoenix
-ENV HOME=/home/phoenix
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+# Unpack the release
+WORKDIR /phoenix
+COPY --chown=phoenix:phoenix --from=build /phoenixd/build/bin/*/phoenixdReleaseExecutable/phoenixd.kexe phoenixd
+COPY --chown=phoenix:phoenix --from=build /phoenixd/build/bin/*/phoenix-cliReleaseExecutable/phoenix-cli.kexe phoenix-cli
+
+# Indicate that the container listens on port 9740
+EXPOSE 9740
+
+# Create the data directory so permissions are preserved when mounted as a volume (otherwise would be mounted as root)
+RUN mkdir -p /phoenix/.phoenix
+# Expose default data directory as VOLUME
+VOLUME [ "/phoenix/.phoenix" ]
+
+# Run the daemon
+COPY --chown=phoenix:phoenix <<'EOF' /phoenix/entrypoint.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Auto-initialize on first run by feeding required confirmations.
+if [ ! -f /phoenix/.phoenix/seed.dat ]; then
+    echo "[entrypoint] First run detected: /phoenix/.phoenix/seed.dat missing. Auto-confirming disclaimers." >&2
+    # Feed the two required "I understand" lines, then keep stdin open (cat) so daemon doesn't see premature EOF.
+    { printf 'I understand\nI understand\n'; cat >/dev/null; } | exec /phoenix/phoenixd "$@"
+else
+    exec /phoenix/phoenixd "$@"
+fi
+EOF
+RUN chmod 0755 /phoenix/entrypoint.sh
+ENTRYPOINT ["/phoenix/entrypoint.sh"]
